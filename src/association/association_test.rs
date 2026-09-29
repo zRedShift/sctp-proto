@@ -3630,6 +3630,193 @@ fn test_assoc_create_new_stream() -> Result<()> {
     Ok(())
 }
 
+fn live_init() -> ChunkInit {
+    let mut init = ChunkInit {
+        initiate_tag: 5678,
+        initial_tsn: 1234,
+        num_outbound_streams: 8,
+        num_inbound_streams: 8,
+        advertised_receiver_window_credit: 64 * 1024,
+        ..Default::default()
+    };
+    init.set_supported_extensions();
+    init
+}
+
+fn init_packet(init: ChunkInit) -> Packet {
+    Packet {
+        common_header: CommonHeader {
+            source_port: 5001,
+            destination_port: 5002,
+            verification_tag: 0,
+        },
+        chunks: vec![Box::new(init)],
+    }
+}
+
+fn established_association(state: AssociationState, now: Instant) -> Association {
+    let mut association = create_association(TransportConfig::default());
+    association
+        .handle_init(&init_packet(live_init()), &live_init())
+        .unwrap();
+    association.control_queue.clear();
+    association.stored_init = None;
+    association.close_all_timers();
+    association.handshake_completed = true;
+    association.set_state(AssociationState::Established);
+    association
+        .open_stream(7, PayloadProtocolIdentifier::Binary)
+        .unwrap()
+        .write(b"already queued data")
+        .unwrap();
+    association.set_state(state);
+    association.immediate_ack_triggered = true;
+    association.delayed_ack_triggered = true;
+    association.timers.start(Timer::Ack, now, 200);
+    association.timers.start(Timer::T2Shutdown, now, 1000);
+    association
+}
+
+#[test]
+fn test_assoc_init_preserves_live_state() {
+    let now = Instant::now();
+    for state in [
+        AssociationState::Established,
+        AssociationState::ShutdownPending,
+        AssociationState::ShutdownSent,
+        AssociationState::ShutdownReceived,
+        AssociationState::ShutdownAckSent,
+    ] {
+        for variant in 0..5 {
+            let mut association = established_association(state, now);
+            let before = format!("{association:?}");
+            let mut init = live_init();
+            match variant {
+                0 => {}
+                1 => init.initial_tsn += 100,
+                2 => init.advertised_receiver_window_credit *= 2,
+                3 => {
+                    init.num_inbound_streams += 1;
+                    init.num_outbound_streams += 1;
+                }
+                4 => init.params.clear(),
+                _ => unreachable!(),
+            }
+            assert!(init.check().is_ok());
+            let result = association.handle_inbound(init_packet(init), now);
+            assert!(result.is_ok(), "{state:?}, variant {variant}: {result:?}");
+            // Include queued data, windows, timers and pending ACKs.
+            assert_eq!(
+                format!("{association:?}"),
+                before,
+                "{state:?}, variant {variant}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_assoc_repeated_init_preserves_state() {
+    let now = Instant::now();
+    let mut association = established_association(AssociationState::Established, now);
+    let before = format!("{association:?}");
+    for _ in 0..1024 {
+        assert!(
+            association
+                .handle_inbound(init_packet(live_init()), now)
+                .is_ok()
+        );
+    }
+    assert_eq!(format!("{association:?}"), before);
+}
+
+#[test]
+fn test_assoc_init_validation() {
+    let now = Instant::now();
+    for variant in 0..2 {
+        let mut association = established_association(AssociationState::Established, now);
+        let before = format!("{association:?}");
+        let mut inbound = init_packet(live_init());
+        if variant == 0 {
+            inbound.common_header.verification_tag = 1;
+        } else {
+            inbound.chunks.push(Box::new(live_init()));
+        }
+        assert!(inbound.check_packet().is_err());
+        assert!(association.handle_inbound(inbound, now).is_ok());
+        assert_eq!(format!("{association:?}"), before);
+    }
+    for (variant, expected) in [
+        (0, Error::ErrChunkTypeInitInitiateTagZero),
+        (1, Error::ErrInitInboundStreamRequestZero),
+        (2, Error::ErrInitOutboundStreamRequestZero),
+        (3, Error::ErrInitAdvertisedReceiver1500),
+    ] {
+        let mut association = established_association(AssociationState::Established, now);
+        let mut init = live_init();
+        match variant {
+            0 => init.initiate_tag = 0,
+            1 => init.num_inbound_streams = 0,
+            2 => init.num_outbound_streams = 0,
+            3 => init.advertised_receiver_window_credit = 1499,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            association.handle_inbound(init_packet(init), now),
+            Err(expected)
+        );
+    }
+}
+
+fn deliver_init_packet(association: &mut Association, now: Instant, raw: Bytes) {
+    let partial = crate::packet::PartialDecode::unmarshal(&raw).unwrap();
+    association.handle_event(AssociationEvent(AssociationEventInner::Datagram(
+        Transmit {
+            now,
+            remote: association.remote_addr,
+            ecn: None,
+            local_ip: None,
+            payload: Payload::PartialDecode(partial),
+        },
+    )));
+}
+
+#[test]
+fn test_assoc_invalid_init_parameter_preserves_state() {
+    let now = Instant::now();
+    let mut association = established_association(AssociationState::Established, now);
+    let before = format!("{association:?}");
+    let mut raw = init_packet(live_init()).marshal().unwrap().to_vec();
+    assert_eq!(raw[32..34], [0x80, 0x08], "supported-extensions parameter");
+    raw[34..36].copy_from_slice(&3_u16.to_be_bytes()); // Parameter length < header.
+    raw[8..12].fill(0);
+    let checksum = crate::util::generate_packet_checksum(&Bytes::from(raw.clone()));
+    raw[8..12].copy_from_slice(&checksum.to_le_bytes());
+    deliver_init_packet(&mut association, now, Bytes::from(raw));
+    assert_eq!(format!("{association:?}"), before);
+}
+
+#[test]
+fn test_assoc_init_ack_and_abort() {
+    let now = Instant::now();
+    let mut association = established_association(AssociationState::Established, now);
+    let mut ack = live_init();
+    ack.is_ack = true;
+    assert!(association.handle_inbound(init_packet(ack), now).is_ok());
+    assert!(
+        !association.immediate_ack_triggered,
+        "INIT-ACK keeps its existing normal path"
+    );
+    assert!(!association.delayed_ack_triggered);
+    let abort = association.create_packet(vec![Box::new(ChunkAbort::default())]);
+    deliver_init_packet(&mut association, now, abort.marshal().unwrap());
+    assert!(association.is_closed());
+    assert!(
+        core::iter::from_fn(|| association.poll())
+            .any(|event| matches!(event, Event::AssociationLost { .. }))
+    );
+}
+
 fn handle_init_test(name: &str, initial_state: AssociationState, expect_err: bool) {
     let mut a = create_association(TransportConfig::default());
     a.set_state(initial_state);
