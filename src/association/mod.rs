@@ -743,7 +743,11 @@ impl Association {
     /// - a call was made to `handle_timeout`
     #[must_use]
     pub fn poll_transmit(&mut self, now: Instant) -> Option<Transmit> {
-        let (contents, _) = self.gather_outbound(now);
+        let (contents, keep_open) = self.gather_outbound(now);
+        if !keep_open {
+            // SHUTDOWN-COMPLETE is serialized and can outlive the association.
+            let _ = self.close();
+        }
         if contents.is_empty() {
             None
         } else {
@@ -1627,6 +1631,19 @@ impl Association {
     fn handle_inbound(&mut self, p: Packet, now: Instant) -> Result<()> {
         if let Err(err) = p.check_packet() {
             warn!("[{}] failed validating packet {}", self.side, err);
+            return Ok(());
+        }
+
+        if (self.state == AssociationState::Established || self.state.is_closing())
+            && let Some(init) = p
+                .chunks
+                .first()
+                .and_then(|chunk| chunk.as_any().downcast_ref::<ChunkInit>())
+            && !init.is_ack
+        {
+            // Restart negotiation is unsupported. Discard a valid INIT without
+            // changing the association or its pending acknowledgments.
+            init.check()?;
             return Ok(());
         }
 
