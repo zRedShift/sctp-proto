@@ -1634,12 +1634,14 @@ impl Association {
             return Ok(());
         }
 
-        if (self.state == AssociationState::Established || self.state.is_closing())
-            && let Some(init) = p
-                .chunks
-                .first()
-                .and_then(|chunk| chunk.as_any().downcast_ref::<ChunkInit>())
-            && !init.is_ack
+        if let Some(init) = p
+            .chunks
+            .first()
+            .and_then(|chunk| chunk.as_any().downcast_ref::<ChunkInit>())
+            .filter(|init| {
+                !init.is_ack
+                    && (self.state == AssociationState::Established || self.state.is_closing())
+            })
         {
             // Restart negotiation is unsupported. Discard a valid INIT without
             // changing the association or its pending acknowledgments.
