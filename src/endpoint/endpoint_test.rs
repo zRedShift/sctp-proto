@@ -3198,6 +3198,413 @@ fn test_server_accepts_init_with_supported_address_types() {
     assert!(init_ack.is_ack);
 }
 
+fn association_packets(association: &mut Association, now: Instant) -> Vec<Bytes> {
+    let mut packets = Vec::new();
+    while let Some(transmit) = association.poll_transmit(now) {
+        let Payload::RawEncode(contents) = transmit.payload else {
+            panic!("expected encoded packets");
+        };
+        packets.extend(contents);
+    }
+    packets
+}
+
+fn pair_with_init() -> (Pair, AssociationHandle, AssociationHandle, Bytes) {
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    let now = pair.time;
+    let packets = association_packets(pair.client_conn_mut(client), now);
+    assert_eq!(packets.len(), 1);
+    let init = packets[0].clone();
+    assert_eq!(init[12], 1);
+    pair.server.inbound.push_back((now, None, init.clone()));
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+    establish_session_pair(&mut pair, client, server, 7).unwrap();
+    (pair, client, server, init)
+}
+
+fn deliver_association_packet(
+    endpoint: &mut TestEndpoint,
+    association: AssociationHandle,
+    now: Instant,
+    remote: SocketAddr,
+    packet: Bytes,
+) {
+    let (handle, event) = endpoint.handle(now, remote, None, None, packet).unwrap();
+    assert_eq!(handle, association);
+    let DatagramEvent::AssociationEvent(event) = event else {
+        panic!("expected an existing association");
+    };
+    endpoint
+        .associations
+        .get_mut(&handle)
+        .unwrap()
+        .handle_event(event);
+}
+
+fn association_losses(association: &mut Association) -> usize {
+    core::iter::from_fn(|| association.poll())
+        .map(|event| match event {
+            Event::AssociationLost { .. } => 1,
+            Event::Connected => panic!("association connected twice"),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn read_stream_data(association: &mut Association) -> Vec<u8> {
+    let chunks = association.stream(7).unwrap().read().unwrap().unwrap();
+    let mut data = vec![0; chunks.len()];
+    assert_eq!(chunks.read(&mut data).unwrap(), data.len());
+    data
+}
+
+// Deliver one side at a time so tests can retain the shutdown packets and
+// inspect the association between receiving an ACK and sending COMPLETE.
+fn drive_shutdown(
+    pair: &mut Pair,
+    client: AssociationHandle,
+    server: AssociationHandle,
+    trace: &mut [Vec<u8>; 2],
+) {
+    for _ in 0..32 {
+        let now = pair.time;
+        for packet in association_packets(pair.client_conn_mut(client), now) {
+            if matches!(packet[12], 7 | 8 | 14) {
+                trace[0].push(packet[12]);
+            }
+            let remote = pair.client.addr;
+            deliver_association_packet(&mut pair.server, server, now, remote, packet);
+        }
+        for packet in association_packets(pair.server_conn_mut(server), now) {
+            if matches!(packet[12], 7 | 8 | 14) {
+                trace[1].push(packet[12]);
+            }
+            let remote = pair.server.addr;
+            deliver_association_packet(&mut pair.client, client, now, remote, packet);
+        }
+        assert!(pair.client.endpoint.poll_transmit().is_none());
+        assert!(pair.server.endpoint.poll_transmit().is_none());
+        if pair.client_conn_mut(client).is_closed() && pair.server_conn_mut(server).is_closed() {
+            break;
+        }
+        pair.time += Duration::from_millis(200);
+        let now = pair.time;
+        pair.client_conn_mut(client).handle_timeout(now);
+        pair.server_conn_mut(server).handle_timeout(now);
+    }
+}
+
+#[test]
+fn test_assoc_duplicate_init_preserves_established_state() {
+    let (mut pair, client, server, init) = pair_with_init();
+    pair.server.inbound.push_back((pair.time, None, init));
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server).state(),
+        AssociationState::Established
+    );
+    assert_eq!(
+        pair.client_conn_mut(client).state(),
+        AssociationState::Established
+    );
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+    pair.client_stream(client, 7)
+        .unwrap()
+        .write(b"after INIT")
+        .unwrap();
+    pair.drive();
+    assert_eq!(
+        read_stream_data(pair.server_conn_mut(server)),
+        b"after INIT"
+    );
+}
+
+#[test]
+fn test_assoc_duplicate_init_during_handshake() {
+    let mut pair = Pair::default();
+    let client = pair.begin_connect(client_config());
+    let now = pair.time;
+    let packets = association_packets(pair.client_conn_mut(client), now);
+    assert_eq!(packets.len(), 1);
+    pair.server
+        .inbound
+        .push_back((now, None, packets[0].clone()));
+    pair.server
+        .inbound
+        .push_back((now, None, packets[0].clone()));
+    pair.drive();
+    let server = pair.server.assert_accept();
+    pair.finish_connect(client, server);
+    assert_eq!(
+        pair.client_conn_mut(client).state(),
+        AssociationState::Established
+    );
+    assert_eq!(
+        pair.server_conn_mut(server).state(),
+        AssociationState::Established
+    );
+}
+
+#[test]
+fn test_assoc_duplicate_init_during_shutdown() {
+    let (mut pair, _, server, init) = pair_with_init();
+    pair.server_conn_mut(server).shutdown().unwrap();
+    let (now, remote) = (pair.time, pair.client.addr);
+    deliver_association_packet(&mut pair.server, server, now, remote, init);
+    assert!(pair.server_conn_mut(server).is_closing());
+    assert!(!pair.server_conn_mut(server).is_closed());
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+}
+
+#[test]
+fn test_new_init_tag_does_not_replace_existing_association() {
+    let (mut pair, client, server, init) = pair_with_init();
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let (_, mut association) = endpoint.connect(client_config(), pair.server.addr).unwrap();
+    let packets = association_packets(&mut association, pair.time);
+    assert_eq!(packets.len(), 1);
+    assert_ne!(&packets[0][16..20], &init[16..20]);
+    let (other, event) = pair
+        .server
+        .handle(pair.time, pair.client.addr, None, None, packets[0].clone())
+        .unwrap();
+    assert_ne!(other, server);
+    let DatagramEvent::NewAssociation(association) = event else {
+        panic!("expected a new association");
+    };
+    drop(association);
+    assert_eq!(
+        pair.server_conn_mut(server).state(),
+        AssociationState::Established
+    );
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+    pair.client_stream(client, 7)
+        .unwrap()
+        .write(b"original association")
+        .unwrap();
+    pair.drive();
+    assert_eq!(
+        read_stream_data(pair.server_conn_mut(server)),
+        b"original association"
+    );
+}
+
+#[test]
+fn test_assoc_invalid_init_checksum_preserves_state() {
+    let (mut pair, client, server, init) = pair_with_init();
+    let mut corrupt = init.to_vec();
+    corrupt[8] ^= 1;
+    pair.server
+        .inbound
+        .push_back((pair.time, None, corrupt.into()));
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server).state(),
+        AssociationState::Established
+    );
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+    pair.client_stream(client, 7)
+        .unwrap()
+        .write(b"after invalid INIT")
+        .unwrap();
+    pair.drive();
+    assert_eq!(
+        read_stream_data(pair.server_conn_mut(server)),
+        b"after invalid INIT"
+    );
+}
+
+#[test]
+fn test_assoc_duplicate_init_preserves_queued_data() {
+    let (mut pair, client, server, init) = pair_with_init();
+    pair.client_stream(client, 7)
+        .unwrap()
+        .write(b"client queued")
+        .unwrap();
+    pair.server_stream(server, 7)
+        .unwrap()
+        .write(b"server queued")
+        .unwrap();
+    let (now, remote) = (pair.time, pair.client.addr);
+    deliver_association_packet(&mut pair.server, server, now, remote, init);
+    assert_eq!(
+        pair.server_conn_mut(server).state(),
+        AssociationState::Established
+    );
+    pair.drive();
+    assert_eq!(
+        read_stream_data(pair.server_conn_mut(server)),
+        b"client queued"
+    );
+    assert_eq!(
+        read_stream_data(pair.client_conn_mut(client)),
+        b"server queued"
+    );
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+    assert_eq!(association_losses(pair.client_conn_mut(client)), 0);
+    pair.client_stream(client, 7)
+        .unwrap()
+        .write(b"client continues")
+        .unwrap();
+    pair.server_stream(server, 7)
+        .unwrap()
+        .write(b"server continues")
+        .unwrap();
+    pair.drive();
+    assert_eq!(
+        read_stream_data(pair.server_conn_mut(server)),
+        b"client continues"
+    );
+    assert_eq!(
+        read_stream_data(pair.client_conn_mut(client)),
+        b"server continues"
+    );
+}
+
+#[test]
+fn test_assoc_shutdown_with_duplicate_init() {
+    for (inflight, initiates) in [(false, true), (true, true), (true, false), (false, false)] {
+        let mut baseline = None;
+        for replay in [false, true] {
+            let (mut pair, client, server, init) = pair_with_init();
+            let now = pair.time;
+            let held = if inflight {
+                pair.server_stream(server, 7)
+                    .unwrap()
+                    .write(b"inflight data")
+                    .unwrap();
+                let packets = association_packets(pair.server_conn_mut(server), now);
+                assert!(!packets.is_empty());
+                packets
+            } else {
+                Vec::new()
+            };
+            let mut trace = [Vec::new(), Vec::new()];
+            if initiates {
+                pair.server_conn_mut(server).shutdown().unwrap();
+            } else {
+                pair.client_conn_mut(client).shutdown().unwrap();
+                let packets = association_packets(pair.client_conn_mut(client), now);
+                assert!(!packets.is_empty());
+                for packet in packets {
+                    if matches!(packet[12], 7 | 8 | 14) {
+                        trace[0].push(packet[12]);
+                    }
+                    let remote = pair.client.addr;
+                    deliver_association_packet(&mut pair.server, server, now, remote, packet);
+                }
+            }
+            assert!(pair.server_conn_mut(server).is_closing());
+            if replay {
+                let remote = pair.client.addr;
+                deliver_association_packet(&mut pair.server, server, now, remote, init);
+            }
+            assert!(pair.server_conn_mut(server).is_closing());
+            assert!(!pair.server_conn_mut(server).is_closed());
+            for packet in held {
+                let remote = pair.server.addr;
+                deliver_association_packet(&mut pair.client, client, now, remote, packet);
+            }
+            drive_shutdown(&mut pair, client, server, &mut trace);
+            let outcome = (
+                pair.client_conn_mut(client).is_closed(),
+                pair.server_conn_mut(server).is_closed(),
+                association_losses(pair.client_conn_mut(client)),
+                association_losses(pair.server_conn_mut(server)),
+                trace,
+            );
+            assert_eq!(
+                (outcome.0, outcome.1, outcome.2, outcome.3),
+                (true, true, 1, 1)
+            );
+            for chunk in [7, 8, 14] {
+                assert!(outcome.4.iter().any(|packets| packets.contains(&chunk)));
+            }
+            if inflight {
+                assert!(pair.client_conn_mut(client).stats().get_num_datas() > 0);
+            }
+            pair.client_conn_mut(client).close().unwrap();
+            pair.server_conn_mut(server).close().unwrap();
+            assert_eq!(association_losses(pair.client_conn_mut(client)), 0);
+            assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+            if let Some(expected) = baseline.as_ref() {
+                assert_eq!(
+                    &outcome, expected,
+                    "inflight={inflight}, initiates={initiates}"
+                );
+            } else {
+                baseline = Some(outcome);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_assoc_shutdown_closes_initiator() {
+    let (mut pair, client, server) = create_association_pair(AckMode::Normal, 0).unwrap();
+    establish_session_pair(&mut pair, client, server, 7).unwrap();
+    pair.server_conn_mut(server).shutdown().unwrap();
+    drive_shutdown(&mut pair, client, server, &mut [Vec::new(), Vec::new()]);
+    let outcome = (
+        pair.client_conn_mut(client).is_closed(),
+        pair.server_conn_mut(server).is_closed(),
+        association_losses(pair.client_conn_mut(client)),
+        association_losses(pair.server_conn_mut(server)),
+    );
+    pair.client_conn_mut(client).close().unwrap();
+    pair.server_conn_mut(server).close().unwrap();
+    assert_eq!(association_losses(pair.client_conn_mut(client)), 0);
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+    assert_eq!(outcome, (true, true, 1, 1));
+}
+
+#[test]
+fn test_assoc_shutdown_complete_outlives_association() {
+    let (mut pair, client, server) = create_association_pair(AckMode::Normal, 0).unwrap();
+    establish_session_pair(&mut pair, client, server, 7).unwrap();
+    let (now, client_addr, server_addr) = (pair.time, pair.client.addr, pair.server.addr);
+    pair.server_conn_mut(server).shutdown().unwrap();
+    let shutdown = association_packets(pair.server_conn_mut(server), now);
+    assert!(shutdown.iter().any(|packet| packet[12] == 7));
+    assert!(pair.server_conn_mut(server).is_closing());
+    for packet in shutdown {
+        deliver_association_packet(&mut pair.client, client, now, server_addr, packet);
+    }
+    let ack = association_packets(pair.client_conn_mut(client), now);
+    assert!(ack.iter().any(|packet| packet[12] == 8));
+    for packet in ack {
+        deliver_association_packet(&mut pair.server, server, now, client_addr, packet);
+    }
+    assert!(pair.server_conn_mut(server).is_closing());
+    assert!(!pair.server_conn_mut(server).stream_ids().is_empty());
+    let complete = pair.server_conn_mut(server).poll_transmit(now).unwrap();
+    let Payload::RawEncode(contents) = complete.payload else {
+        panic!("expected encoded packets");
+    };
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0][12], 14);
+    assert!(pair.server_conn_mut(server).is_closed());
+    assert!(pair.server_conn_mut(server).stream_ids().is_empty());
+    assert!(pair.server_conn_mut(server).poll_timeout().is_none());
+    assert!(association_packets(pair.server_conn_mut(server), now).is_empty());
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 1);
+    pair.server_conn_mut(server)
+        .handle_timeout(now + Duration::from_secs(3600));
+    pair.server_conn_mut(server).close().unwrap();
+    assert!(association_packets(pair.server_conn_mut(server), now).is_empty());
+    assert_eq!(association_losses(pair.server_conn_mut(server)), 0);
+    drop(pair.server.associations.remove(&server));
+    for packet in contents {
+        deliver_association_packet(&mut pair.client, client, now, server_addr, packet);
+    }
+    assert!(association_packets(pair.client_conn_mut(client), now).is_empty());
+    assert!(pair.client_conn_mut(client).is_closed());
+    assert_eq!(association_losses(pair.client_conn_mut(client)), 1);
+}
+
 #[test]
 fn test_server_retransmitted_init_routes_to_existing_association() {
     let now = Instant::now();
