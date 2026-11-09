@@ -3053,10 +3053,10 @@ impl Association {
                     let n_bytes_acked = c.user_data.len() as i64;
 
                     // Sum the number of bytes acknowledged per stream
-                    if !self
+                    if self
                         .streams
                         .get(&c.stream_identifier)
-                        .is_some_and(|stream| c.message_id < stream.first_message_id)
+                        .is_none_or(|stream| c.message_id >= stream.first_message_id)
                     {
                         *bytes_acked_per_stream
                             .entry(c.stream_identifier)
@@ -3123,10 +3123,10 @@ impl Association {
                 if let Some(c) = self.outbound_queue.get(tsn) {
                     if !is_acked && !c.abandoned {
                         // Sum the number of bytes acknowledged per stream
-                        if !self
+                        if self
                             .streams
                             .get(&c.stream_identifier)
-                            .is_some_and(|stream| c.message_id < stream.first_message_id)
+                            .is_none_or(|stream| c.message_id >= stream.first_message_id)
                         {
                             *bytes_acked_per_stream
                                 .entry(c.stream_identifier)

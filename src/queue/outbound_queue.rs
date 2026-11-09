@@ -56,7 +56,7 @@ impl OutboundQueue {
         if !chunk.beginning_fragment
             || chunk.user_data.is_empty()
             || chunk.payload_type == crate::PayloadProtocolIdentifier::Dcep
-            || !chunk.deadline.is_some_and(|deadline| now >= deadline)
+            || chunk.deadline.is_none_or(|deadline| now < deadline)
         {
             return None;
         }
@@ -130,7 +130,7 @@ impl OutboundQueue {
         let chunk = self.pending.peek()?;
         if chunk.beginning_fragment
             || chunk.payload_type == crate::PayloadProtocolIdentifier::Dcep
-            || !chunk.deadline.is_some_and(|deadline| now >= deadline)
+            || chunk.deadline.is_none_or(|deadline| now < deadline)
         {
             return None;
         }
